@@ -429,7 +429,10 @@ export class AIChatViewProvider implements vscode.WebviewViewProvider {
             {
                 name: 'Available Models',
                 models: [
-                    { id: 'gpt-4.1', name: 'GPT-4.1', multiplier: '1.0x' }
+                    { id: 'auto', name: 'Auto (Recommended)', multiplier: '' },
+                    { id: 'claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', multiplier: '' },
+                    { id: 'gpt-4.1', name: 'GPT-4.1', multiplier: '' },
+                    { id: 'gpt-5.4', name: 'GPT-5.4', multiplier: '' }
                 ]
             }
         ];

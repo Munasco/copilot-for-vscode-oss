@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
 import * as os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as cp from 'child_process';
 
 // SDK types - loaded dynamically since the SDK is ESM-only
 type CopilotClient = any;
@@ -40,6 +43,98 @@ export class CopilotService {
     private currentSystemMessage: string | undefined = undefined;
 
     /**
+     * Resolves the copilot CLI executable and environment variables (including PATH)
+     */
+    private resolveCliConfig(): { cliPath: string; env: NodeJS.ProcessEnv } {
+        const config = vscode.workspace.getConfiguration('copilot-oss');
+        const configuredPath = config.get<string>('cliPath');
+        const home = os.homedir();
+
+        const searchDirs: string[] = [
+            '/opt/homebrew/bin',
+            '/usr/local/bin',
+            path.join(home, '.local/bin'),
+            path.join(home, 'bin'),
+            path.join(home, '.volta/bin'),
+            path.join(home, '.asdf/shims')
+        ];
+
+        // Search NVM node versions
+        const nvmBase = path.join(home, '.nvm/versions/node');
+        if (fs.existsSync(nvmBase)) {
+            try {
+                const versions = fs.readdirSync(nvmBase);
+                for (const v of versions) {
+                    searchDirs.unshift(path.join(nvmBase, v, 'bin'));
+                }
+            } catch {}
+        }
+
+        // Search FNM
+        const fnmBase = path.join(home, '.local/share/fnm/current/bin');
+        if (fs.existsSync(fnmBase)) {
+            searchDirs.unshift(fnmBase);
+        }
+
+        let resolvedCliPath: string | null = null;
+        let binDir: string | null = null;
+
+        if (configuredPath && fs.existsSync(configuredPath)) {
+            resolvedCliPath = configuredPath;
+            binDir = path.dirname(configuredPath);
+        } else {
+            for (const dir of searchDirs) {
+                const candidate = path.join(dir, 'copilot');
+                if (fs.existsSync(candidate)) {
+                    resolvedCliPath = candidate;
+                    binDir = dir;
+                    break;
+                }
+            }
+
+            // Fallback: ask login shell
+            if (!resolvedCliPath && process.platform !== 'win32') {
+                try {
+                    const shell = process.env.SHELL || '/bin/zsh';
+                    const stdout = cp.execSync(`${shell} -l -c "which copilot"`, {
+                        encoding: 'utf8',
+                        timeout: 3000
+                    }).trim();
+                    if (stdout && fs.existsSync(stdout)) {
+                        resolvedCliPath = stdout;
+                        binDir = path.dirname(stdout);
+                    }
+                } catch {}
+            }
+        }
+
+        const finalCliPath = resolvedCliPath || 'copilot';
+
+        // Augment PATH to ensure node and copilot binaries are accessible to spawned subshell
+        const extraPaths = [
+            binDir,
+            ...searchDirs,
+            '/opt/homebrew/bin',
+            '/usr/local/bin',
+            '/usr/bin',
+            '/bin',
+            '/usr/sbin',
+            '/sbin'
+        ].filter(Boolean) as string[];
+
+        const currentPath = process.env.PATH || '';
+        const augmentedPath = Array.from(new Set([...extraPaths, ...currentPath.split(path.delimiter)])).join(path.delimiter);
+
+        const env: NodeJS.ProcessEnv = {
+            ...process.env,
+            PATH: augmentedPath
+        };
+
+        console.log('[CopilotService] Resolved CLI Path:', finalCliPath);
+        return { cliPath: finalCliPath, env };
+    }
+
+    /**
      * Sets the webview instance for sending messages
      */
     setWebview(webview: vscode.Webview): void {
@@ -50,14 +145,12 @@ export class CopilotService {
      * Initializes the Copilot client and logs connection state
      */
     async initialize(): Promise<void> {
-        if (this.isInitialized) {
+        if (this.isInitialized && this.client) {
             return;
         }
 
         try {
             // Dynamic import of the ESM-only SDK
-            // Use Function constructor to prevent TypeScript from compiling import() to require()
-            // This is necessary because @github/copilot-sdk is ESM-only ("type": "module")
             const importDynamic = new Function('specifier', 'return import(specifier)');
             const sdk = await importDynamic('@github/copilot-sdk');
             this.CopilotClientClass = sdk.CopilotClient;
@@ -69,25 +162,37 @@ export class CopilotService {
                 : os.homedir();
             console.log('[CopilotService] Using working directory:', cwd);
 
-            // Create the Copilot client with the working directory
-            this.client = new this.CopilotClientClass({ cwd });
+            const { cliPath, env } = this.resolveCliConfig();
 
-            // Log initial connection state
-            const initialState = this.client.getState();
-            console.log('[CopilotService] Initial connection state:', initialState);
+            // Create the Copilot client with the working directory, resolved CLI path, and augmented env
+            this.client = new this.CopilotClientClass({
+                cwd,
+                cliPath,
+                env
+            });
 
             // Start the client (connects to Copilot CLI server)
             await this.client.start();
 
-            // Log connection state after start
-            const connectedState = this.client.getState();
-            console.log('[CopilotService] Connection state after start:', connectedState);
+            // Check authentication status
+            try {
+                if (typeof this.client.getAuthStatus === 'function') {
+                    const authStatus = await this.client.getAuthStatus();
+                    console.log('[CopilotService] Auth status:', authStatus);
+                    if (authStatus && !authStatus.isAuthenticated) {
+                        vscode.window.showWarningMessage('GitHub Copilot CLI is not authenticated. Please run "copilot" in your terminal to log in.');
+                    }
+                }
+            } catch (authErr) {
+                console.warn('[CopilotService] Unable to check auth status:', authErr);
+            }
 
             this.isInitialized = true;
             console.log('[CopilotService] Copilot SDK initialized successfully');
         } catch (error) {
             console.error('[CopilotService] Failed to initialize Copilot client:', error);
-            throw new Error('Failed to initialize Copilot SDK. Ensure Copilot CLI is installed.');
+            const msg = error instanceof Error ? error.message : String(error);
+            throw new Error(`Failed to initialize Copilot SDK: ${msg}`);
         }
     }
 
@@ -101,7 +206,16 @@ export class CopilotService {
 
         // Close existing session if any
         if (this.session) {
-            await this.session.destroy();
+            try {
+                if (typeof this.session.disconnect === 'function') {
+                    await this.session.disconnect();
+                } else if (typeof this.session.destroy === 'function') {
+                    await this.session.destroy();
+                }
+            } catch (err) {
+                console.warn('[CopilotService] Error disconnecting existing session:', err);
+            }
+            this.session = null;
         }
 
         try {
@@ -112,7 +226,6 @@ export class CopilotService {
             };
 
             // Add custom system message if provided using 'append' mode
-            // This adds to (not replaces) the SDK's default system message
             if (systemMessage && systemMessage.trim()) {
                 sessionConfig.systemMessage = {
                     mode: 'append',
@@ -283,17 +396,11 @@ export class CopilotService {
         const args = data.arguments || {};
         const result = data.result || {};
 
-        // Log for debugging file path extraction
-        // if (toolName.includes('edit') || toolName.includes('write') || toolName.includes('view')) {
-        //     console.log(`[CopilotService] Tool: ${toolName}, Args:`, JSON.stringify(args, null, 2));
-        // }
-
-        // Extract human-readable label and details based on tool type
         let label = toolName;
         let details: string | undefined;
 
         switch (toolName) {
-            case 'view':  // SDK uses 'view' for file reading
+            case 'view':
             case 'read_file':
             case 'view_file': {
                 const viewPath = this.extractFilePath(args);
@@ -322,7 +429,7 @@ export class CopilotService {
                 break;
             }
 
-            case 'edit':  // Add 'edit' as a possible tool name
+            case 'edit':
             case 'edit_file':
             case 'replace_file_content':
             case 'multi_replace_file_content': {
@@ -330,7 +437,6 @@ export class CopilotService {
                 label = status === 'loading'
                     ? `Editing ${this.getFileName(editPath)}`
                     : `Edit ${this.getFileName(editPath)}`;
-                // Try to extract line change details from result
                 if (result.linesAdded !== undefined || result.linesRemoved !== undefined) {
                     const added = result.linesAdded || 0;
                     const removed = result.linesRemoved || 0;
@@ -377,13 +483,11 @@ export class CopilotService {
                 break;
 
             default:
-                // Format unknown tool names nicely
                 label = status === 'loading'
                     ? toolName.replace(/_/g, ' ').replace(/^\w/, (c: string) => c.toUpperCase()) + '...'
                     : toolName.replace(/_/g, ' ').replace(/^\w/, (c: string) => c.toUpperCase());
         }
 
-        // Handle error details
         if (status === 'error' && data.error) {
             details = data.error.message || 'Error occurred';
         }
@@ -403,7 +507,6 @@ export class CopilotService {
      * Extracts file path from various possible argument field names
      */
     private extractFilePath(args: any): string {
-        // Try various common field names used by different tools
         return args.path ||
             args.AbsolutePath ||
             args.TargetFile ||
@@ -467,7 +570,6 @@ export class CopilotService {
         }
     }
 
-
     /**
      * Stops the current generation
      */
@@ -487,6 +589,19 @@ export class CopilotService {
      * Selects a new model
      */
     async selectModel(modelId: string): Promise<void> {
+        if (this.session && typeof this.session.setModel === 'function') {
+            try {
+                await this.session.setModel(modelId);
+                this.currentModel = modelId;
+                this.webview?.postMessage({
+                    type: 'modelChanged',
+                    modelId
+                });
+                return;
+            } catch (err) {
+                console.warn('[CopilotService] session.setModel failed, falling back to recreate session:', err);
+            }
+        }
         await this.createSession(modelId);
         this.webview?.postMessage({
             type: 'modelChanged',
@@ -498,6 +613,15 @@ export class CopilotService {
      * Creates a new session (clears context)
      */
     newSession(): void {
+        if (this.session) {
+            try {
+                if (typeof this.session.disconnect === 'function') {
+                    this.session.disconnect();
+                } else if (typeof this.session.destroy === 'function') {
+                    this.session.destroy();
+                }
+            } catch {}
+        }
         this.session = null;
         this.currentMessageId = null;
     }
@@ -511,20 +635,20 @@ export class CopilotService {
         }
 
         try {
-            const sessions = await this.client!.listSessions();
-            console.log('[CopilotService] Listed sessions:', sessions.length);
-            console.log('[CopilotService] Sessions:', sessions);
-            return sessions;
+            if (typeof this.client!.listSessions === 'function') {
+                const sessions = await this.client!.listSessions();
+                console.log('[CopilotService] Listed sessions:', sessions.length);
+                return sessions;
+            }
+            return [];
         } catch (error) {
             console.error('[CopilotService] Failed to list sessions:', error);
-            // Return empty array if SDK is not available or fails
             return [];
         }
     }
 
     /**
-     * Lists all available models from the Copilot SDK
-     * Returns models with properties for categorization and display
+     * Lists all available models from the Copilot SDK and standard Copilot model list
      */
     async listModels(): Promise<ModelOption[]> {
         if (!this.client) {
@@ -532,31 +656,57 @@ export class CopilotService {
         }
 
         try {
-            const models = await this.client!.listModels();
-            console.log('[CopilotService] Listed models:', models.length);
-
-            // Transform SDK models to ModelOption format
-            const modelOptions: ModelOption[] = models.map((model: any) => ({
-                id: model.id,
-                name: model.name || model.id,
-                multiplier: model.billing?.multiplier ? `${model.billing.multiplier}x` : '',
-                isPremium: model.billing?.is_premium ?? false,
-                supportsVision: model.capabilities?.supports?.vision ?? false,
-                isEnabled: model.policy?.state === 'enabled',
-                restrictedTo: model.billing?.restricted_to
-            }));
-
-            // Sort: enabled models first, then alphabetically by name
-            modelOptions.sort((a, b) => {
-                // Enabled models come first
-                if (a.isEnabled !== b.isEnabled) {
-                    return a.isEnabled ? -1 : 1;
+            let sdkModels: any[] = [];
+            try {
+                if (typeof this.client!.listModels === 'function') {
+                    sdkModels = await this.client!.listModels();
                 }
-                // Then sort alphabetically by name
-                return a.name.localeCompare(b.name);
-            });
+            } catch (err) {
+                console.warn('[CopilotService] client.listModels() failed, will use fallback catalogue:', err);
+            }
 
-            return modelOptions;
+            console.log('[CopilotService] Listed models from SDK:', sdkModels.length);
+
+            // GitHub Copilot models
+            const standardModels: ModelOption[] = [
+                { id: 'auto', name: 'Auto (Recommended)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'claude-opus-4.6', name: 'Claude Opus 4.6', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'gpt-4.1', name: 'GPT-4.1', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'gpt-5.4', name: 'GPT-5.4', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'o3-mini', name: 'o3-mini', multiplier: '', isPremium: false, supportsVision: false, isEnabled: true },
+                { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+            ];
+
+            const seenIds = new Set<string>();
+            const result: ModelOption[] = [];
+
+            // Add SDK reported models first
+            for (const model of sdkModels) {
+                if (!model || !model.id) continue;
+                seenIds.add(model.id);
+                result.push({
+                    id: model.id,
+                    name: model.name || model.id,
+                    multiplier: model.billing?.multiplier ? `${model.billing.multiplier}x` : '',
+                    isPremium: model.billing?.is_premium ?? false,
+                    supportsVision: model.capabilities?.supports?.vision ?? true,
+                    isEnabled: model.policy ? model.policy.state === 'enabled' : true,
+                    restrictedTo: model.billing?.restricted_to
+                });
+            }
+
+            // Merge standard models if not already present
+            for (const sm of standardModels) {
+                if (!seenIds.has(sm.id)) {
+                    seenIds.add(sm.id);
+                    result.push(sm);
+                }
+            }
+
+            return result;
         } catch (error) {
             console.error('[CopilotService] Failed to list models:', error);
             throw error;
@@ -573,13 +723,15 @@ export class CopilotService {
 
         // Close existing session if any
         if (this.session) {
-            await this.session.destroy();
+            try {
+                if (typeof this.session.disconnect === 'function') {
+                    await this.session.disconnect();
+                } else if (typeof this.session.destroy === 'function') {
+                    await this.session.destroy();
+                }
+            } catch {}
+            this.session = null;
         }
-
-        // DON'T set currentModel from parameter - we'll detect it from the session
-        // The modelId parameter is now deprecated and will be ignored
-        // Store original model to restore if session resume fails
-        // const originalModel = this.currentModel;
 
         try {
             this.session = await this.client!.resumeSession(sessionId, {
@@ -588,13 +740,13 @@ export class CopilotService {
             this.session.on(this.handleEvent.bind(this));
             console.log(`[CopilotService] Resumed session: ${sessionId}`);
 
-            const models = await this.client!.listModels();
-            console.log('[CopilotService] Models:', JSON.stringify(models[0], null, 2));
-
             // Load all events from the session
-            const events = await this.session.getMessages();
-            console.log('[CopilotService] Session Model:', events[0].data.selectedModel);
-            const originalModel = events[0].data.selectedModel;
+            const events = typeof this.session.getEvents === 'function'
+                ? await this.session.getEvents()
+                : (typeof this.session.getMessages === 'function' ? await this.session.getMessages() : []);
+
+            const firstEvent = events && events[0];
+            const originalModel = firstEvent?.data?.selectedModel;
 
             // Group events into conversation turns and track model changes
             const turns: ConversationTurn[] = [];
@@ -604,13 +756,11 @@ export class CopilotService {
             for (const event of events) {
                 switch (event.type) {
                     case 'session.model_change':
-                        // Track model changes throughout the session
                         currentSessionModel = event.data.newModel;
                         console.log(`[CopilotService] Model changed to: ${currentSessionModel}`);
                         break;
 
                     case 'user.message':
-                        // Start new conversation turn
                         currentTurn = {
                             userMessage: event,
                             assistantMessages: [],
@@ -622,7 +772,6 @@ export class CopilotService {
 
                     case 'assistant.message':
                         if (!currentTurn) {
-                            // Edge case: assistant without user message
                             currentTurn = {
                                 userMessage: null,
                                 assistantMessages: [],
@@ -635,8 +784,7 @@ export class CopilotService {
                         break;
 
                     case 'assistant.usage':
-                        // Update the active model from usage events (more reliable)
-                        if (event.data.model && currentTurn) {
+                        if (event.data?.model && currentTurn) {
                             currentTurn.activeModel = event.data.model;
                         }
                         break;
@@ -668,42 +816,35 @@ export class CopilotService {
             let lastUsedModel: string | null = null;
 
             for (const turn of turns) {
-                // Add user message if present
                 if (turn.userMessage) {
                     messages.push({
                         id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         role: 'user',
-                        content: turn.userMessage.data.content || '',
+                        content: turn.userMessage.data?.content || '',
                         timestamp: Date.now()
                     });
                 }
 
-                // Process each assistant message with its tool events
                 for (const assistantEvent of turn.assistantMessages) {
                     const toolEvents: ToolEvent[] = [];
 
-                    // Build tool events from execution pairs
                     for (const [_toolCallId, execution] of turn.toolExecutions) {
                         if (execution.start) {
-                            // Merge start and complete data (same as live sessions)
                             const completeData = execution.complete ? {
                                 ...execution.complete.data,
                                 toolName: execution.start.data.toolName,
                                 arguments: execution.start.data.arguments
                             } : execution.start.data;
 
-                            // Determine status: success, error, or loading (incomplete)
                             const status = execution.complete
                                 ? (execution.complete.data.success ? 'success' : 'error')
                                 : 'loading';
 
-                            // Reuse existing createToolEvent() method
                             const toolEvent = this.createToolEvent(completeData, status);
                             toolEvents.push(toolEvent);
                         }
                     }
 
-                    // Use the model that was active during this turn
                     const messageModel = turn.activeModel || this.currentModel || undefined;
                     if (messageModel) {
                         lastUsedModel = messageModel;
@@ -712,7 +853,7 @@ export class CopilotService {
                     messages.push({
                         id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         role: 'assistant',
-                        content: assistantEvent.data.content || '',
+                        content: assistantEvent.data?.content || '',
                         timestamp: Date.now(),
                         model: messageModel,
                         toolEvents: toolEvents.length > 0 ? toolEvents : undefined
@@ -720,13 +861,10 @@ export class CopilotService {
                 }
             }
 
-            // Filter out messages with empty content
             const validMessages = messages.filter(msg => msg.content.trim() !== '');
 
-            // Update the current model to match the session's last used model
             if (lastUsedModel) {
                 this.currentModel = lastUsedModel;
-                // Notify webview to update selected model
                 if (this.webview) {
                     this.webview.postMessage({
                         type: 'modelChanged',
@@ -749,7 +887,11 @@ export class CopilotService {
     async dispose(): Promise<void> {
         try {
             if (this.session) {
-                await this.session.destroy();
+                if (typeof this.session.disconnect === 'function') {
+                    await this.session.disconnect();
+                } else if (typeof this.session.destroy === 'function') {
+                    await this.session.destroy();
+                }
             }
             if (this.client) {
                 await this.client.stop();
