@@ -288,6 +288,23 @@ export class CopilotService {
         console.log('[CopilotService] Session event:', event.type, event.data);
 
         switch (event.type) {
+            case 'model.turn_started':
+            case 'model.call_start':
+            case 'model.model_call_started': {
+                const modelName = event.data?.modelInfo?.name || event.data?.model;
+                if (modelName && this.currentMessageId) {
+                    const label = this.currentModel?.startsWith('auto:')
+                        ? `Auto [${this.currentModel.substring(5)}] (${modelName})`
+                        : (this.currentModel === 'auto' ? `Auto (${modelName})` : modelName);
+                    this.webview.postMessage({
+                        type: 'updateMessageModel',
+                        messageId: this.currentMessageId,
+                        model: label
+                    });
+                }
+                break;
+            }
+
             case 'session.auto_mode_resolved': {
                 const chosen = event.data?.chosenModel || event.data?.model;
                 if (chosen && this.currentMessageId) {
