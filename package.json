@@ -54,8 +54,18 @@
       "properties": {
         "copilot-oss.defaultModel": {
           "type": "string",
-          "default": "gpt-4.1",
-          "description": "%config.defaultModel.description%"
+          "default": "auto",
+          "description": "Default Auto Mode tier or model"
+        },
+        "copilot-oss.permissions": {
+          "type": "string",
+          "enum": [
+            "approveAll",
+            "denyDangerous",
+            "ask"
+          ],
+          "default": "approveAll",
+          "description": "Permission handling policy for tool executions (file edits, terminal execution, etc.)"
         },
         "copilot-oss.cliPath": {
           "type": "string",

@@ -148,7 +148,7 @@ export class AIChatViewProvider implements vscode.WebviewViewProvider {
 
         // Send initial data to the webview
         const config = vscode.workspace.getConfiguration('copilot-oss');
-        const defaultModel = config.get<string>('defaultModel', 'gpt-4.1');
+        const defaultModel = config.get<string>('defaultModel', 'auto');
 
         this._sendMessage({
             type: 'init',
@@ -426,29 +426,13 @@ export class AIChatViewProvider implements vscode.WebviewViewProvider {
     private _getAvailableModels() {
         return [
             {
-                name: 'Auto Modes',
+                name: 'Auto Mode Tiers',
                 models: [
                     { id: 'auto', name: 'Auto (Default)', multiplier: '' },
                     { id: 'auto:balance', name: 'Auto (Balance)', multiplier: '' },
                     { id: 'auto:intelligence', name: 'Auto (Intelligence)', multiplier: '' },
                     { id: 'auto:efficiency', name: 'Auto (Efficiency)', multiplier: '' },
                     { id: 'auto:fast', name: 'Auto (Fast)', multiplier: '' }
-                ]
-            },
-            {
-                name: 'Standard Models',
-                models: [
-                    { id: 'claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', multiplier: '' },
-                    { id: 'gpt-4.1', name: 'GPT-4.1', multiplier: '' },
-                    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', multiplier: '' }
-                ]
-            },
-            {
-                name: 'Premium Models',
-                models: [
-                    { id: 'gpt-5.4', name: 'GPT-5.4', multiplier: '' },
-                    { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', multiplier: '' },
-                    { id: 'claude-opus-4.6', name: 'Claude Opus 4.6', multiplier: '' }
                 ]
             }
         ];
@@ -457,35 +441,12 @@ export class AIChatViewProvider implements vscode.WebviewViewProvider {
     private async _handleRequestModels(): Promise<void> {
         try {
             const models = await this._copilotService.listModels();
-
-            // Separate models into Auto Modes, Standard and Premium categories
-            const autoModels = models.filter(m => m.id === 'auto' || m.id.startsWith('auto:'));
-            const standardModels = models.filter(m => !m.isPremium && m.id !== 'auto' && !m.id.startsWith('auto:'));
-            const premiumModels = models.filter(m => m.isPremium && m.id !== 'auto' && !m.id.startsWith('auto:'));
-
-            // Build categories (only include non-empty categories)
-            const categories: { name: string; models: ModelOption[] }[] = [];
-
-            if (autoModels.length > 0) {
-                categories.push({
-                    name: 'Auto Modes',
-                    models: autoModels
-                });
-            }
-
-            if (standardModels.length > 0) {
-                categories.push({
-                    name: 'Standard Models',
-                    models: standardModels
-                });
-            }
-
-            if (premiumModels.length > 0) {
-                categories.push({
-                    name: 'Premium Models',
-                    models: premiumModels
-                });
-            }
+            const categories = [
+                {
+                    name: 'Auto Mode Tiers',
+                    models
+                }
+            ];
 
             this._sendMessage({
                 type: 'modelsLoaded',

@@ -37,10 +37,30 @@ export class CopilotService {
     private currentModel: string | null = null;
     private isInitialized = false;
     private CopilotClientClass: any = null;
+    private approveAllFn: any = null;
     // Track pending tool calls so completion events can access tool info
     private pendingToolCalls: Map<string, { toolName: string; arguments: any }> = new Map();
     // Track current system message for session
     private currentSystemMessage: string | undefined = undefined;
+
+    /**
+     * Resolves the permission handler based on user settings
+     */
+    private getPermissionHandler(): any {
+        const config = vscode.workspace.getConfiguration('copilot-oss');
+        const policy = config.get<string>('permissions') || 'approveAll';
+
+        if (policy === 'approveAll' && this.approveAllFn) {
+            return this.approveAllFn;
+        }
+
+        return (request: any) => {
+            if (policy === 'denyDangerous' && request?.kind === 'shell') {
+                return { kind: 'reject', feedback: 'Shell command execution is restricted by user policy.' };
+            }
+            return { kind: 'approve-once' };
+        };
+    }
 
     /**
      * Resolves the copilot CLI executable and environment variables (including PATH)
@@ -154,6 +174,7 @@ export class CopilotService {
             const importDynamic = new Function('specifier', 'return import(specifier)');
             const sdk = await importDynamic('@github/copilot-sdk');
             this.CopilotClientClass = sdk.CopilotClient;
+            this.approveAllFn = sdk.approveAll;
 
             // Determine working directory: first workspace folder or user home
             const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -239,6 +260,7 @@ export class CopilotService {
             const sessionConfig: any = {
                 model: actualModel,
                 streaming: true,
+                onPermissionRequest: this.getPermissionHandler(),
             };
 
             // Add custom system message if provided using 'append' mode
@@ -755,82 +777,16 @@ export class CopilotService {
     }
 
     /**
-     * Lists all available models from the Copilot SDK and standard Copilot model list
+     * Lists all available Auto Mode tiers
      */
     async listModels(): Promise<ModelOption[]> {
-        if (!this.client) {
-            await this.initialize();
-        }
-
-        try {
-            let sdkModels: any[] = [];
-            try {
-                if (typeof this.client!.listModels === 'function') {
-                    sdkModels = await this.client!.listModels();
-                }
-            } catch (err) {
-                console.warn('[CopilotService] client.listModels() failed, will use fallback catalogue:', err);
-            }
-
-            console.log('[CopilotService] Listed models from SDK:', sdkModels.length);
-
-            // Complete catalogue of GitHub Copilot models and tiers
-            const standardModels: ModelOption[] = [
-                // Auto Tiers
-                { id: 'auto', name: 'Auto (Default)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'auto:balance', name: 'Auto (Balance)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'auto:intelligence', name: 'Auto (Intelligence)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'auto:efficiency', name: 'Auto (Efficiency)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'auto:fast', name: 'Auto (Fast)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-
-                // Standard Models
-                { id: 'claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'gpt-4.1', name: 'GPT-4.1', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'gpt-4o', name: 'GPT-4o', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'o3-mini', name: 'o3-mini', multiplier: '', isPremium: false, supportsVision: false, isEnabled: true },
-                { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-
-                // Premium / Frontier Models
-                { id: 'gpt-5.4', name: 'GPT-5.4', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
-                { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
-                { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
-                { id: 'claude-opus-4.6', name: 'Claude Opus 4.6', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
-                { id: 'claude-opus-4.7', name: 'Claude Opus 4.7', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
-                { id: 'o1', name: 'o1', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
-            ];
-
-            const seenIds = new Set<string>();
-            const result: ModelOption[] = [];
-
-            // Add SDK reported models first
-            for (const model of sdkModels) {
-                if (!model || !model.id) continue;
-                seenIds.add(model.id);
-                result.push({
-                    id: model.id,
-                    name: model.name || model.id,
-                    multiplier: model.billing?.multiplier ? `${model.billing.multiplier}x` : '',
-                    isPremium: model.billing?.is_premium ?? false,
-                    supportsVision: model.capabilities?.supports?.vision ?? true,
-                    isEnabled: model.policy ? model.policy.state === 'enabled' : true,
-                    restrictedTo: model.billing?.restricted_to
-                });
-            }
-
-            // Merge standard models if not already present
-            for (const sm of standardModels) {
-                if (!seenIds.has(sm.id)) {
-                    seenIds.add(sm.id);
-                    result.push(sm);
-                }
-            }
-
-            return result;
-        } catch (error) {
-            console.error('[CopilotService] Failed to list models:', error);
-            throw error;
-        }
+        return [
+            { id: 'auto', name: 'Auto (Default)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+            { id: 'auto:balance', name: 'Auto (Balance)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+            { id: 'auto:intelligence', name: 'Auto (Intelligence)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+            { id: 'auto:efficiency', name: 'Auto (Efficiency)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+            { id: 'auto:fast', name: 'Auto (Fast)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+        ];
     }
 
     /**
@@ -856,6 +812,7 @@ export class CopilotService {
         try {
             this.session = await this.client!.resumeSession(sessionId, {
                 streaming: true,
+                onPermissionRequest: this.getPermissionHandler(),
             });
             this.session.on(this.handleEvent.bind(this));
             console.log(`[CopilotService] Resumed session: ${sessionId}`);
