@@ -71,6 +71,11 @@
           "type": "string",
           "default": "",
           "description": "Path to GitHub Copilot CLI executable (leave empty for auto-detection)"
+        },
+        "copilot-oss.workingDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Custom working directory for the Copilot service (defaults to the active workspace folder)"
         }
       }
     },

@@ -55,8 +55,24 @@ export class AIChatViewProvider implements vscode.WebviewViewProvider {
             }
         });
 
+        // Notify webview of active editor / workspace changes
+        const activeEditorListener = vscode.window.onDidChangeActiveTextEditor(() => {
+            if (this._view && this._view.visible) {
+                const vsContext = this._copilotService.getVSCodeContext();
+                this._sendMessage({
+                    type: 'contextUpdated',
+                    workspace: {
+                        name: vsContext.workspaceName,
+                        path: vsContext.workspacePath,
+                        activeFile: vsContext.activeFileRelativePath
+                    }
+                });
+            }
+        });
+
         // Handle disposal
         webviewView.onDidDispose(() => {
+            activeEditorListener.dispose();
             this._view = undefined;
         });
     }
@@ -149,13 +165,19 @@ export class AIChatViewProvider implements vscode.WebviewViewProvider {
         // Send initial data to the webview
         const config = vscode.workspace.getConfiguration('copilot-oss');
         const defaultModel = config.get<string>('defaultModel', 'auto');
+        const vsContext = this._copilotService.getVSCodeContext();
 
         this._sendMessage({
             type: 'init',
             models: this._getAvailableModels(),
             history: [], // Will be loaded from webview state
             defaultModel,
-            locale: vscode.env.language
+            locale: vscode.env.language,
+            workspace: {
+                name: vsContext.workspaceName,
+                path: vsContext.workspacePath,
+                activeFile: vsContext.activeFileRelativePath
+            }
         });
     }
 

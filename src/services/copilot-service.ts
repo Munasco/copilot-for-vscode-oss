@@ -42,6 +42,8 @@ export class CopilotService {
     private pendingToolCalls: Map<string, { toolName: string; arguments: any }> = new Map();
     // Track current system message for session
     private currentSystemMessage: string | undefined = undefined;
+    // Track current workspace path for session
+    private currentWorkspacePath: string | null = null;
 
     /**
      * Resolves the permission handler based on user settings
@@ -60,6 +62,123 @@ export class CopilotService {
             }
             return { kind: 'approve-once' };
         };
+    }
+    /**
+     * Resolves the effective working directory based on current editor/workspace context
+     */
+    public getEffectiveWorkingDirectory(): string {
+        // 1. If an active text editor is open, check if it belongs to a workspace folder
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor && activeEditor.document && activeEditor.document.uri && activeEditor.document.uri.scheme === 'file') {
+            const workspaceFolder = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri);
+            if (workspaceFolder) {
+                return workspaceFolder.uri.fsPath;
+            }
+            const parentDir = path.dirname(activeEditor.document.uri.fsPath);
+            if (fs.existsSync(parentDir)) {
+                return parentDir;
+            }
+        }
+
+        // 2. First workspace folder
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (workspaceFolders && workspaceFolders.length > 0) {
+            return workspaceFolders[0].uri.fsPath;
+        }
+
+        // 3. User configured working directory
+        const config = vscode.workspace.getConfiguration('copilot-oss');
+        const configuredDir = config.get<string>('workingDirectory');
+        if (configuredDir && fs.existsSync(configuredDir)) {
+            return configuredDir;
+        }
+
+        // 4. Fallback to process.cwd() or user home
+        if (process.cwd() && process.cwd() !== '/' && fs.existsSync(process.cwd())) {
+            return process.cwd();
+        }
+
+        return os.homedir();
+    }
+
+    /**
+     * Gathers rich VS Code context (active file, open tabs, language, selection, workspace)
+     */
+    public getVSCodeContext(): {
+        workspaceName?: string;
+        workspacePath?: string;
+        activeFilePath?: string;
+        activeFileRelativePath?: string;
+        languageId?: string;
+        selectionText?: string;
+        selectionRange?: { startLine: number; endLine: number };
+        openFiles?: string[];
+    } {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        const activeEditor = vscode.window.activeTextEditor;
+        const currentCwd = this.getEffectiveWorkingDirectory();
+
+        const context: {
+            workspaceName?: string;
+            workspacePath?: string;
+            activeFilePath?: string;
+            activeFileRelativePath?: string;
+            languageId?: string;
+            selectionText?: string;
+            selectionRange?: { startLine: number; endLine: number };
+            openFiles?: string[];
+        } = {
+            workspacePath: currentCwd,
+            workspaceName: workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].name : path.basename(currentCwd),
+        };
+
+        if (activeEditor && activeEditor.document && activeEditor.document.uri && activeEditor.document.uri.scheme === 'file') {
+            const fsPath = activeEditor.document.uri.fsPath;
+            context.activeFilePath = fsPath;
+            context.activeFileRelativePath = path.relative(currentCwd, fsPath);
+            context.languageId = activeEditor.document.languageId;
+
+            const selection = activeEditor.selection;
+            if (!selection.isEmpty) {
+                context.selectionText = activeEditor.document.getText(selection);
+                context.selectionRange = {
+                    startLine: selection.start.line + 1,
+                    endLine: selection.end.line + 1,
+                };
+            }
+        }
+
+        try {
+            const openFiles = vscode.window.visibleTextEditors
+                .filter(e => e.document?.uri?.scheme === 'file')
+                .map(e => path.relative(currentCwd, e.document.uri.fsPath));
+            if (openFiles.length > 0) {
+                context.openFiles = Array.from(new Set(openFiles));
+            }
+        } catch {}
+
+        return context;
+    }
+
+    /**
+     * Formats VS Code context into an instruction string for the Copilot agent
+     */
+    public getVSCodeContextPrompt(): string {
+        const ctx = this.getVSCodeContext();
+        const lines: string[] = [
+            `VS Code Environment Context:`,
+            `- Workspace Directory: ${ctx.workspacePath || 'None'}`,
+            `- Workspace Name: ${ctx.workspaceName || 'Untitled'}`,
+        ];
+
+        if (ctx.activeFileRelativePath) {
+            lines.push(`- Active File: ${ctx.activeFileRelativePath} (Language: ${ctx.languageId || 'text'})`);
+        }
+        if (ctx.openFiles && ctx.openFiles.length > 1) {
+            lines.push(`- Open Editor Files: ${ctx.openFiles.join(', ')}`);
+        }
+
+        return lines.join('\n');
     }
 
     /**
@@ -176,17 +295,15 @@ export class CopilotService {
             this.CopilotClientClass = sdk.CopilotClient;
             this.approveAllFn = sdk.approveAll;
 
-            // Determine working directory: first workspace folder or user home
-            const workspaceFolders = vscode.workspace.workspaceFolders;
-            const cwd = workspaceFolders && workspaceFolders.length > 0
-                ? workspaceFolders[0].uri.fsPath
-                : os.homedir();
+            // Determine working directory dynamically based on active workspace/editor
+            const cwd = this.getEffectiveWorkingDirectory();
             console.log('[CopilotService] Using working directory:', cwd);
 
             const { cliPath, env } = this.resolveCliConfig();
 
-            // Create the Copilot client with the working directory, resolved CLI path, and augmented env
+            // Create the Copilot client with workingDirectory, resolved CLI path, and augmented env
             this.client = new this.CopilotClientClass({
+                workingDirectory: cwd,
                 cwd,
                 cliPath,
                 env
@@ -254,6 +371,9 @@ export class CopilotService {
         }
 
         const { actualModel, autoTier } = this.parseModelSelection(model);
+        const effectiveCwd = this.getEffectiveWorkingDirectory();
+        const vsContextPrompt = this.getVSCodeContextPrompt();
+        const combinedSystemMessage = [systemMessage?.trim(), vsContextPrompt].filter(Boolean).join('\n\n');
 
         try {
             // Build session configuration
@@ -261,18 +381,20 @@ export class CopilotService {
                 model: actualModel,
                 streaming: true,
                 onPermissionRequest: this.getPermissionHandler(),
+                workingDirectory: effectiveCwd,
             };
 
             // Add custom system message if provided using 'append' mode
-            if (systemMessage && systemMessage.trim()) {
+            if (combinedSystemMessage) {
                 sessionConfig.systemMessage = {
                     mode: 'append',
-                    content: systemMessage.trim()
+                    content: combinedSystemMessage
                 };
             }
 
             // Create session with the SDK
             this.session = await this.client!.createSession(sessionConfig);
+            this.currentWorkspacePath = effectiveCwd;
 
             // Set autoTier if auto model
             if (actualModel === 'auto' && typeof this.session.setAutoTier === 'function') {
@@ -640,9 +762,11 @@ export class CopilotService {
      * Sends a message to the AI
      */
     async sendMessage(prompt: string, modelId: string, attachments: FileAttachment[], systemMessage?: string): Promise<void> {
-        // Check if we need a new session (no session, or system message changed)
+        // Check if we need a new session (no session, system message changed, or workspace changed)
+        const effectiveCwd = this.getEffectiveWorkingDirectory();
         const systemMessageChanged = this.currentSystemMessage !== systemMessage;
-        if (!this.session || systemMessageChanged) {
+        const workspaceChanged = this.currentWorkspacePath !== null && this.currentWorkspacePath !== effectiveCwd;
+        if (!this.session || systemMessageChanged || workspaceChanged) {
             await this.createSession(modelId, systemMessage);
         }
 
@@ -660,15 +784,39 @@ export class CopilotService {
 
         try {
             // Prepare attachments for SDK format
-            const sdkAttachments = attachments.map(att => ({
+            const sdkAttachments: any[] = attachments.map(att => ({
                 type: att.type,
                 path: att.path,
                 displayName: att.name
             }));
 
+            // Check dynamic VS Code editor context
+            const activeContext = this.getVSCodeContext();
+            let finalPrompt = prompt;
+
+            // If user has selected text in editor, automatically provide the selection
+            if (activeContext.selectionText && activeContext.activeFilePath) {
+                const alreadyAttached = attachments.some(a => a.path === activeContext.activeFilePath);
+                if (!alreadyAttached) {
+                    sdkAttachments.push({
+                        type: 'selection',
+                        filePath: activeContext.activeFilePath,
+                        displayName: `${path.basename(activeContext.activeFilePath)} (L${activeContext.selectionRange?.startLine}-${activeContext.selectionRange?.endLine})`,
+                        selection: activeContext.selectionRange ? {
+                            start: { line: activeContext.selectionRange.startLine - 1, character: 0 },
+                            end: { line: activeContext.selectionRange.endLine - 1, character: 0 }
+                        } : undefined,
+                        text: activeContext.selectionText
+                    });
+                }
+            } else if (activeContext.activeFileRelativePath && !attachments.some(a => a.path === activeContext.activeFilePath)) {
+                // If user didn't attach the active file, inform the agent of the active open file
+                finalPrompt = `[Context: Active editor file is \`${activeContext.activeFileRelativePath}\` in workspace \`${activeContext.workspaceName}\`]\n\n${prompt}`;
+            }
+
             // Send to session
             await this.session.send({
-                prompt,
+                prompt: finalPrompt,
                 attachments: sdkAttachments.length > 0 ? sdkAttachments : undefined
             });
         } catch (error) {
@@ -810,12 +958,15 @@ export class CopilotService {
         }
 
         try {
+            const effectiveCwd = this.getEffectiveWorkingDirectory();
             this.session = await this.client!.resumeSession(sessionId, {
                 streaming: true,
                 onPermissionRequest: this.getPermissionHandler(),
+                workingDirectory: effectiveCwd,
             });
+            this.currentWorkspacePath = effectiveCwd;
             this.session.on(this.handleEvent.bind(this));
-            console.log(`[CopilotService] Resumed session: ${sessionId}`);
+            console.log(`[CopilotService] Resumed session: ${sessionId} (cwd: ${effectiveCwd})`);
 
             // Load all events from the session
             const events = typeof this.session.getEvents === 'function'
