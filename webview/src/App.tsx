@@ -107,6 +107,14 @@ function App() {
                 setSelectedModelId(message.modelId);
                 break;
 
+            case 'updateMessageModel':
+                setMessages(prev => prev.map(msg =>
+                    msg.id === message.messageId
+                        ? { ...msg, model: message.model }
+                        : msg
+                ));
+                break;
+
             case 'clearHistory':
                 // Only clear if we should honor this response
                 if (shouldHonorClearHistory) {

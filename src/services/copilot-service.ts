@@ -196,6 +196,20 @@ export class CopilotService {
         }
     }
 
+    private parseModelSelection(model: string): { actualModel: string; autoTier: string | null } {
+        if (model.startsWith('auto:')) {
+            const tier = model.substring(5);
+            return {
+                actualModel: 'auto',
+                autoTier: tier === 'default' ? null : tier
+            };
+        }
+        if (model === 'auto') {
+            return { actualModel: 'auto', autoTier: null };
+        }
+        return { actualModel: model, autoTier: null };
+    }
+
     /**
      * Creates a new session with the specified model and optional system message
      */
@@ -218,10 +232,12 @@ export class CopilotService {
             this.session = null;
         }
 
+        const { actualModel, autoTier } = this.parseModelSelection(model);
+
         try {
             // Build session configuration
             const sessionConfig: any = {
-                model,
+                model: actualModel,
                 streaming: true,
             };
 
@@ -236,6 +252,16 @@ export class CopilotService {
             // Create session with the SDK
             this.session = await this.client!.createSession(sessionConfig);
 
+            // Set autoTier if auto model
+            if (actualModel === 'auto' && typeof this.session.setAutoTier === 'function') {
+                try {
+                    await this.session.setAutoTier(autoTier);
+                    console.log(`[CopilotService] Auto tier set to: ${autoTier}`);
+                } catch (err) {
+                    console.warn(`[CopilotService] Failed to set auto tier ${autoTier}:`, err);
+                }
+            }
+
             // Subscribe to session events
             this.session.on(this.handleEvent.bind(this));
 
@@ -243,7 +269,7 @@ export class CopilotService {
             this.currentModel = model;
             this.currentSystemMessage = systemMessage;
 
-            console.log(`[CopilotService] Session created with model: ${model}${systemMessage ? ', with custom system message' : ''}`);
+            console.log(`[CopilotService] Session created with model: ${model}${autoTier ? ` (tier: ${autoTier})` : ''}${systemMessage ? ', with custom system message' : ''}`);
         } catch (error) {
             console.error('[CopilotService] Failed to create session:', error);
             throw error;
@@ -262,6 +288,51 @@ export class CopilotService {
         console.log('[CopilotService] Session event:', event.type, event.data);
 
         switch (event.type) {
+            case 'session.auto_mode_resolved': {
+                const chosen = event.data?.chosenModel || event.data?.model;
+                if (chosen && this.currentMessageId) {
+                    const label = this.currentModel?.startsWith('auto:')
+                        ? `Auto [${this.currentModel.substring(5)}] (${chosen})`
+                        : `Auto (${chosen})`;
+                    this.webview.postMessage({
+                        type: 'updateMessageModel',
+                        messageId: this.currentMessageId,
+                        model: label
+                    });
+                }
+                break;
+            }
+
+            case 'assistant.usage': {
+                const model = event.data?.model;
+                if (model && this.currentMessageId && (this.currentModel === 'auto' || this.currentModel?.startsWith('auto:'))) {
+                    const label = this.currentModel.startsWith('auto:')
+                        ? `Auto [${this.currentModel.substring(5)}] (${model})`
+                        : `Auto (${model})`;
+                    this.webview.postMessage({
+                        type: 'updateMessageModel',
+                        messageId: this.currentMessageId,
+                        model: label
+                    });
+                }
+                break;
+            }
+
+            case 'model.message': {
+                const model = event.data?.modelCall?.model;
+                if (model && this.currentMessageId && (this.currentModel === 'auto' || this.currentModel?.startsWith('auto:'))) {
+                    const label = this.currentModel.startsWith('auto:')
+                        ? `Auto [${this.currentModel.substring(5)}] (${model})`
+                        : `Auto (${model})`;
+                    this.webview.postMessage({
+                        type: 'updateMessageModel',
+                        messageId: this.currentMessageId,
+                        model: label
+                    });
+                }
+                break;
+            }
+
             case 'assistant.message_delta':
                 // Streaming chunk
                 this.webview.postMessage({
@@ -589,17 +660,36 @@ export class CopilotService {
      * Selects a new model
      */
     async selectModel(modelId: string): Promise<void> {
-        if (this.session && typeof this.session.setModel === 'function') {
+        const { actualModel, autoTier } = this.parseModelSelection(modelId);
+
+        if (this.session) {
             try {
-                await this.session.setModel(modelId);
-                this.currentModel = modelId;
-                this.webview?.postMessage({
-                    type: 'modelChanged',
-                    modelId
-                });
-                return;
+                if (actualModel === 'auto') {
+                    if (this.currentModel !== 'auto' && !this.currentModel?.startsWith('auto:')) {
+                        if (typeof this.session.setModel === 'function') {
+                            await this.session.setModel('auto');
+                        }
+                    }
+                    if (typeof this.session.setAutoTier === 'function') {
+                        await this.session.setAutoTier(autoTier);
+                    }
+                    this.currentModel = modelId;
+                    this.webview?.postMessage({
+                        type: 'modelChanged',
+                        modelId
+                    });
+                    return;
+                } else if (typeof this.session.setModel === 'function') {
+                    await this.session.setModel(actualModel);
+                    this.currentModel = modelId;
+                    this.webview?.postMessage({
+                        type: 'modelChanged',
+                        modelId
+                    });
+                    return;
+                }
             } catch (err) {
-                console.warn('[CopilotService] session.setModel failed, falling back to recreate session:', err);
+                console.warn('[CopilotService] session.setModel/setAutoTier failed, falling back to recreate session:', err);
             }
         }
         await this.createSession(modelId);
@@ -667,17 +757,30 @@ export class CopilotService {
 
             console.log('[CopilotService] Listed models from SDK:', sdkModels.length);
 
-            // GitHub Copilot models
+            // Complete catalogue of GitHub Copilot models and tiers
             const standardModels: ModelOption[] = [
-                { id: 'auto', name: 'Auto (Recommended)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                // Auto Tiers
+                { id: 'auto', name: 'Auto (Default)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'auto:balance', name: 'Auto (Balance)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'auto:intelligence', name: 'Auto (Intelligence)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'auto:efficiency', name: 'Auto (Efficiency)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+                { id: 'auto:fast', name: 'Auto (Fast)', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+
+                // Standard Models
                 { id: 'claude-3.5-sonnet', name: 'Claude 3.5 Sonnet', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
-                { id: 'claude-opus-4.6', name: 'Claude Opus 4.6', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
                 { id: 'gpt-4.1', name: 'GPT-4.1', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
-                { id: 'gpt-5.4', name: 'GPT-5.4', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'gpt-4o', name: 'GPT-4o', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
                 { id: 'o3-mini', name: 'o3-mini', multiplier: '', isPremium: false, supportsVision: false, isEnabled: true },
                 { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
                 { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', multiplier: '', isPremium: false, supportsVision: true, isEnabled: true },
+
+                // Premium / Frontier Models
+                { id: 'gpt-5.4', name: 'GPT-5.4', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'claude-opus-4.6', name: 'Claude Opus 4.6', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'claude-opus-4.7', name: 'Claude Opus 4.7', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
+                { id: 'o1', name: 'o1', multiplier: '', isPremium: true, supportsVision: true, isEnabled: true },
             ];
 
             const seenIds = new Set<string>();
